@@ -101,10 +101,9 @@ fn sessions_command() -> Result<()> {
 
     // Print header
     println!(
-        "{:<width$}  {:<8}  {}",
+        "{:<width$}  {:<8}  LAST ACTIVE",
         "SESSION",
         "STATUS",
-        "LAST ACTIVE",
         width = session_col
     );
     println!("{}", "-".repeat(session_col + 2 + 8 + 2 + 20));
