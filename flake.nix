@@ -29,13 +29,13 @@
             echo "clawscope dev shell"
             echo "  cargo build   - build the project"
             echo "  cargo test    - run tests"
-            echo "  cargo run -- sessions  - list sessions"
+            echo "  cargo run -- session list-sessions --output text  - list sessions"
           '';
         };
 
         packages.default = pkgs.rustPlatform.buildRustPackage {
           pname = "clawscope";
-          version = "0.1.0";
+          version = "0.2.0";
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;
         };

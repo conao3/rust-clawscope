@@ -1,27 +1,90 @@
-use anyhow::{Context, Result};
-use chrono::Utc;
-use clap::{Parser, Subcommand};
-use serde::Deserialize;
+mod error;
+mod grammar;
+mod output;
+
+use chrono::{DateTime, Utc};
+use clap::{Args, CommandFactory, Parser, Subcommand};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::fmt::Write;
+use std::path::{Path, PathBuf};
+
+use error::{other, parameter, target, Result};
+use grammar::{CliInputArgs, SkeletonKind};
+use output::{OutputFormat, Response};
 
 #[derive(Parser)]
 #[command(name = "clawscope", about = "Inspect OpenClaw agent sessions", version)]
 struct Cli {
+    /// Output format (text prints the session table)
+    #[arg(long, global = true, help_heading = "Global Options", value_enum, default_value_t = OutputFormat::Json)]
+    output: OutputFormat,
+    /// JMESPath expression applied to the output
+    #[arg(
+        long,
+        global = true,
+        help_heading = "Global Options",
+        value_name = "JMESPATH"
+    )]
+    query: Option<String>,
+    /// Print debug logs to stderr
+    #[arg(long, global = true, help_heading = "Global Options")]
+    debug: bool,
     #[command(subcommand)]
     command: Commands,
 }
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Inspect OpenClaw sessions
+    #[command(subcommand)]
+    Session(SessionCommand),
+}
+
+#[derive(Subcommand)]
+enum SessionCommand {
     /// List all OpenClaw sessions with status and last active time
-    Sessions,
+    #[command(name = "list-sessions")]
+    List(ListSessionsArgs),
+}
+
+#[derive(Args)]
+struct ListSessionsArgs {
+    /// Path of the OpenClaw sessions.json (defaults to ~/.openclaw/agents/main/sessions/sessions.json)
+    #[arg(long)]
+    sessions_file: Option<PathBuf>,
+    #[command(flatten)]
+    input: CliInputArgs,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SessionEntry {
     updated_at: i64,
+}
+
+#[derive(Serialize, Default)]
+#[serde(rename_all = "PascalCase")]
+struct ListSessionsReport {
+    sessions: Vec<SessionSummary>,
+}
+
+#[derive(Serialize, Default)]
+#[serde(rename_all = "PascalCase")]
+struct SessionSummary {
+    session_key: String,
+    status: String,
+    updated_at: String,
+    last_active: String,
+}
+
+impl ListSessionsReport {
+    fn skeleton() -> Self {
+        Self {
+            sessions: vec![SessionSummary::default()],
+        }
+    }
 }
 
 fn format_relative_time(ms: i64) -> String {
@@ -70,14 +133,21 @@ fn is_active(updated_at_ms: i64) -> bool {
     (now - updated_at_ms) < five_minutes_ms
 }
 
-fn sessions_command() -> Result<()> {
-    let sessions_path: PathBuf = dirs_path();
-
-    let content = std::fs::read_to_string(&sessions_path)
-        .with_context(|| format!("Failed to read sessions file: {}", sessions_path.display()))?;
+fn list_sessions(sessions_path: &Path) -> Result<ListSessionsReport> {
+    let content = std::fs::read_to_string(sessions_path).map_err(|error| {
+        target(format!(
+            "Failed to read sessions file: {}: {error}",
+            sessions_path.display()
+        ))
+    })?;
 
     let sessions: HashMap<String, SessionEntry> =
-        serde_json::from_str(&content).context("Failed to parse sessions.json")?;
+        serde_json::from_str(&content).map_err(|error| {
+            target(format!(
+                "Failed to parse {}: {error}",
+                sessions_path.display()
+            ))
+        })?;
 
     // Sort sessions: active first, then by updatedAt descending
     let mut entries: Vec<(&String, &SessionEntry)> = sessions.iter().collect();
@@ -91,56 +161,193 @@ fn sessions_command() -> Result<()> {
         }
     });
 
+    Ok(ListSessionsReport {
+        sessions: entries
+            .into_iter()
+            .map(|(key, entry)| SessionSummary {
+                session_key: key.clone(),
+                status: if is_active(entry.updated_at) {
+                    "active"
+                } else {
+                    "stopped"
+                }
+                .to_string(),
+                updated_at: DateTime::<Utc>::from_timestamp_millis(entry.updated_at)
+                    .map(|time| time.to_rfc3339())
+                    .unwrap_or_default(),
+                last_active: format_relative_time(entry.updated_at),
+            })
+            .collect(),
+    })
+}
+
+fn render_text(report: &ListSessionsReport) -> String {
+    let mut out = String::new();
+
     // Compute column widths
-    let session_col = entries
+    let session_col = report
+        .sessions
         .iter()
-        .map(|(k, _)| k.len())
+        .map(|session| session.session_key.len())
         .max()
         .unwrap_or(7)
         .max(7); // "SESSION".len()
 
     // Print header
-    println!(
+    let _ = writeln!(
+        out,
         "{:<width$}  {:<8}  LAST ACTIVE",
         "SESSION",
         "STATUS",
         width = session_col
     );
-    println!("{}", "-".repeat(session_col + 2 + 8 + 2 + 20));
+    let _ = writeln!(out, "{}", "-".repeat(session_col + 2 + 8 + 2 + 20));
 
-    for (key, entry) in &entries {
-        let status = if is_active(entry.updated_at) {
-            "active"
-        } else {
-            "stopped"
-        };
-        let last_active = format_relative_time(entry.updated_at);
-        println!(
+    for session in &report.sessions {
+        let _ = writeln!(
+            out,
             "{:<width$}  {:<8}  {}",
-            key,
-            status,
-            last_active,
+            session.session_key,
+            session.status,
+            session.last_active,
             width = session_col
         );
     }
 
-    Ok(())
+    out
 }
 
-fn dirs_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-    PathBuf::from(home)
+fn default_sessions_path() -> Result<PathBuf> {
+    let home = std::env::var("HOME")
+        .map_err(|_| other("HOME is not set; pass --sessions-file".to_string()))?;
+    Ok(PathBuf::from(home)
         .join(".openclaw")
         .join("agents")
         .join("main")
         .join("sessions")
-        .join("sessions.json")
+        .join("sessions.json"))
 }
 
-fn main() -> Result<()> {
-    let cli = Cli::parse();
+fn to_value<T: Serialize>(value: &T) -> Result<Value> {
+    serde_json::to_value(value).map_err(|error| other(error.to_string()))
+}
 
-    match cli.command {
-        Commands::Sessions => sessions_command(),
+fn output_skeleton(path: &[String]) -> Result<Value> {
+    match path.last().map(String::as_str) {
+        Some("list-sessions") => to_value(&ListSessionsReport::skeleton()),
+        _ => Err(parameter(
+            "--generate-cli-skeleton needs a command and a subcommand",
+        )),
+    }
+}
+
+fn main() {
+    let code = match run() {
+        Ok(()) => 0,
+        Err(error) => {
+            eprintln!("error: {error}");
+            error.exit_code()
+        }
+    };
+    std::process::exit(code);
+}
+
+fn run() -> Result<()> {
+    let mut root = Cli::command();
+    root.build();
+    let prepared = grammar::prepare(&root, std::env::args_os().collect())?;
+    let debug = prepared.argv.iter().any(|token| token == "--debug");
+    if debug {
+        eprintln!("debug: argv {:?}", &prepared.argv[1..]);
+    }
+
+    if let Some(kind) = prepared.skeleton {
+        let mut command = &root;
+        for name in &prepared.path {
+            command = command
+                .find_subcommand(name)
+                .ok_or_else(|| other(format!("unknown subcommand {name}")))?;
+        }
+        if command.has_subcommands() {
+            return Err(parameter(
+                "--generate-cli-skeleton needs a command and a subcommand",
+            ));
+        }
+        let value = match kind {
+            SkeletonKind::Input => grammar::input_skeleton(command),
+            SkeletonKind::Output => output_skeleton(&prepared.path)?,
+        };
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&value).map_err(|error| other(error.to_string()))?
+        );
+        return Ok(());
+    }
+
+    let cli = match Cli::try_parse_from(&prepared.argv) {
+        Ok(cli) => cli,
+        Err(error) => {
+            let code = if error.use_stderr() { 252 } else { 0 };
+            let _ = error.print();
+            std::process::exit(code);
+        }
+    };
+
+    if let Some(query) = &cli.query {
+        output::compile_query(query)?;
+    }
+    let Commands::Session(SessionCommand::List(args)) = cli.command;
+    let sessions_path = match args.sessions_file {
+        Some(path) => path,
+        None => default_sessions_path()?,
+    };
+    if debug {
+        eprintln!("debug: sessions file {}", sessions_path.display());
+    }
+    let report = list_sessions(&sessions_path)?;
+    let text = render_text(&report);
+    print!(
+        "{}",
+        output::render(
+            &grammar::pascal_case("list-sessions"),
+            Response {
+                value: to_value(&report)?,
+                text: Some(text),
+            },
+            cli.output,
+            cli.query.as_deref()
+        )?
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn list_sessions_puts_active_first_and_rejects_a_missing_file() {
+        let dir = std::env::temp_dir().join(format!("clawscope-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sessions.json");
+        let now = Utc::now().timestamp_millis();
+        std::fs::write(
+            &path,
+            format!(r#"{{"agent:old":{{"updatedAt":0}},"agent:main:main":{{"updatedAt":{now}}}}}"#),
+        )
+        .unwrap();
+        let report = list_sessions(&path).unwrap();
+        let keys: Vec<_> = report
+            .sessions
+            .iter()
+            .map(|session| (session.session_key.as_str(), session.status.as_str()))
+            .collect();
+        assert_eq!(
+            keys,
+            [("agent:main:main", "active"), ("agent:old", "stopped")]
+        );
+        assert_eq!(report.sessions[1].updated_at, "1970-01-01T00:00:00+00:00");
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(list_sessions(&path).err().unwrap().exit_code(), 254);
     }
 }
