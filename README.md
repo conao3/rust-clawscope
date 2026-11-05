@@ -68,6 +68,16 @@ Without `--output text`, clawscope prints the same list as JSON:
 }
 ```
 
+Pick fields from the JSON with `jq`, for example the keys of the active sessions:
+
+```bash
+clawscope session list-sessions | jq -r '.Sessions[] | select(.Status == "active") | .SessionKey'
+```
+
+```
+agent:main:main
+```
+
 **Status values:**
 - `active` — session was updated within the last 5 minutes
 - `stopped` — session has not been updated recently
@@ -81,9 +91,7 @@ Without `--output text`, clawscope prints the same list as JSON:
 Common to every subcommand:
 
 - A value starting with `file://` is replaced by the content of that file. Read stdin with `file:///dev/stdin`.
-- `--cli-input-json file://input.json` passes all parameters as a JSON object keyed by the PascalCase parameter names (`SessionsFile`). Parameters given on the command line take precedence.
-- `--generate-cli-skeleton input|output` prints the input or output skeleton.
-- Global options: `--output json|text|table` (default `json`; `text` prints the session table), `--query <JMESPath>` (for example `--query "Sessions[?Status=='active'].SessionKey" --output text`), `--debug`, `--version`.
+- Global options: `--output json|text|table` (default `json`; `text` prints the session table), `--debug`, `--version`.
 - `help` works at every level: `clawscope help`, `clawscope session help`, `clawscope session list-sessions help`.
 - Exit codes: `0` success, `252` syntax or parameter error, `254` the sessions file cannot be read or parsed, `255` other failures.
 

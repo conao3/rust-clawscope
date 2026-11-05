@@ -13,6 +13,5 @@ path = "src/main.rs"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
-jmespath = "0.5.0"
 unicode-width = "0.2.3"
 chrono = { version = "0.4", features = ["serde"] }
